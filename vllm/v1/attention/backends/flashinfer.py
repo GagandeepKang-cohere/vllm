@@ -328,6 +328,8 @@ class BatchDCPPrefillWrapper:
             self._dcp_combine = partial(cp_lse_ag_out_rs, is_lse_base_on_e=False)
         self._context = BatchPrefillWithPagedKVCacheWrapper(workspace_buffer, kv_layout)
         self._new_tokens = BatchPrefillWithRaggedKVCacheWrapper(workspace_buffer)
+        # Populated by plan() when the trtllm-gen context path is enabled.
+        self._trtllm_ctx: dict | None = None
 
     def plan(
         self,
@@ -348,8 +350,13 @@ class BatchDCPPrefillWrapper:
         kv_cache_dtype: torch.dtype,
         prefill_fixed_split_size: int,
         disable_split_kv: bool,
+        trtllm_context: dict | None = None,
     ):
         """Plan the prefill operation with given parameters."""
+        # When trtllm_context is provided, run() uses the trtllm-gen paged
+        # context kernel instead of self._context. We still plan self._context
+        # as a correctness fallback (cheap host-side setup).
+        self._trtllm_ctx = trtllm_context
         self._context.plan(
             qo_indptr=qo_indptr_cpu,
             paged_kv_indptr=paged_kv_indptr_cpu,
@@ -395,13 +402,52 @@ class BatchDCPPrefillWrapper:
         prefill_query_across_dcp = get_dcp_group().all_gather(
             prefill_query.contiguous(), dim=1
         )
-        output_context_tmp, lse_context_tmp = self._context.run(
-            prefill_query_across_dcp,
-            kv_cache_tuple,
-            k_scale=layer._k_scale_float,
-            v_scale=layer._v_scale_float,
-            return_lse=True,
-        )
+        if self._trtllm_ctx is None:
+            output_context_tmp, lse_context_tmp = self._context.run(
+                prefill_query_across_dcp,
+                kv_cache_tuple,
+                k_scale=layer._k_scale_float,
+                v_scale=layer._v_scale_float,
+                return_lse=True,
+            )
+        else:
+            # trtllm-gen non-causal paged context over the DCP-local KV shard.
+            # Returns per-shard LSE so the existing cross-rank combine still
+            # applies. KV layout must be HND (asserted on the non-DCP trtllm
+            # path); global-attention layers have window_left == -1.
+            c = self._trtllm_ctx
+            q = canonicalize_singleton_dim_strides(
+                prefill_query_across_dcp.contiguous()
+            )
+            output_context_tmp = torch.empty_like(q)
+            lse_context_tmp = torch.empty(
+                (q.shape[0], q.shape[1]),
+                dtype=torch.float32,
+                device=q.device,
+            )
+            # bf16 path: q/k/v scale == 1.0, so bmm1 == sm_scale, bmm2 == 1.0;
+            # computed via layer scales to mirror forward()'s bmm scale logic.
+            bmm1_scale = c["sm_scale"] * layer._q_scale_float * layer._k_scale_float
+            bmm2_scale = layer._v_scale_float
+            trtllm_batch_context_with_kv_cache(
+                query=q,
+                kv_cache=kv_cache_tuple,
+                workspace_buffer=c["workspace"],
+                block_tables=c["block_tables"],
+                seq_lens=c["seq_lens"],
+                max_q_len=c["max_q_len"],
+                max_kv_len=c["max_kv_len"],
+                bmm1_scale=bmm1_scale,
+                bmm2_scale=bmm2_scale,
+                batch_size=c["batch_size"],
+                cum_seq_lens_q=c["cum_seq_lens_q"],
+                cum_seq_lens_kv=c["cum_seq_lens_kv"],
+                window_left=c["window_left"],
+                causal=False,
+                return_lse=True,
+                lse=lse_context_tmp,
+                out=output_context_tmp,
+            )
         output_context, lse_context = self._dcp_combine(
             output_context_tmp,
             lse_context_tmp,
@@ -1675,6 +1721,44 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                     kv_lens_prefill_cpu = kv_lens_prefill_cpu.pin_memory()
                 if self.use_dcp:
                     assert isinstance(prefill_wrapper, BatchDCPPrefillWrapper)
+                    # Optionally prepare metadata for the trtllm-gen context
+                    # kernel (non-causal + LSE), which is considerably faster
+                    # than the FlashInfer native paged kernel. Only for
+                    # full-attention (window_left == -1), unquantized-KV layers.
+                    trtllm_context = None
+                    if (
+                        envs.VLLM_DCP_TRTLLM_PREFILL
+                        and self.window_left == -1
+                        and self.kv_cache_spec.kv_quant_mode == KVQuantMode.NONE
+                    ):
+                        device = block_table_tensor.device
+                        # seq_lens_cpu is already the DCP-local *context* length
+                        # (query tokens subtracted, sharded across DCP ranks).
+                        ctx_seq_lens_cpu = seq_lens_cpu[prefill_start:].to(torch.int32)
+                        num_blocks_ctx = (ctx_seq_lens_cpu + page_size - 1) // page_size
+                        cum_kv_cpu = torch.zeros(num_prefills + 1, dtype=torch.int32)
+                        torch.cumsum(num_blocks_ctx, dim=0, out=cum_kv_cpu[1:])
+                        query_lens_prefill_cpu = (
+                            qo_indptr_prefill_cpu[1:] - qo_indptr_prefill_cpu[:-1]
+                        )
+                        trtllm_context = {
+                            "block_tables": block_table_tensor[prefill_start:],
+                            "seq_lens": ctx_seq_lens_cpu.to(device),
+                            "cum_seq_lens_q": (
+                                qo_indptr[prefill_start:] - qo_indptr[prefill_start]
+                            ),
+                            "cum_seq_lens_kv": cum_kv_cpu.to(device),
+                            "max_q_len": int(query_lens_prefill_cpu.max().item()),
+                            "max_kv_len": (
+                                int(ctx_seq_lens_cpu.max().item())
+                                if num_prefills
+                                else 0
+                            ),
+                            "batch_size": num_prefills,
+                            "sm_scale": self.sm_scale,
+                            "window_left": self.window_left,
+                            "workspace": _get_trtllm_workspace_buffer(),
+                        }
                     prefill_wrapper.plan(
                         qo_indptr_cpu=qo_indptr_prefill_cpu,
                         paged_kv_indptr_cpu=paged_kv_indptr_prefill_cpu,
@@ -1693,6 +1777,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                         kv_cache_dtype=self.kv_cache_dtype,
                         prefill_fixed_split_size=self.prefill_fixed_split_size,
                         disable_split_kv=self.disable_split_kv,
+                        trtllm_context=trtllm_context,
                     )
                 else:
                     assert isinstance(
@@ -2196,12 +2281,13 @@ class FlashInferImpl(AttentionImpl):
                             "FlashInfer DCP prefill does not support KV-sharing layers"
                         )
                     assert isinstance(prefill_wrapper, BatchDCPPrefillWrapper)
-                    assert prefill_wrapper._context._window_left == self.window_left
-                    assert prefill_wrapper._context._logits_soft_cap == (
-                        self.logits_soft_cap or 0.0
-                    )
-                    assert prefill_wrapper._context._sm_scale == self.scale
-                    assert not prefill_wrapper._context._causal
+                    if prefill_wrapper._trtllm_ctx is None:
+                        assert prefill_wrapper._context._window_left == self.window_left
+                        assert prefill_wrapper._context._logits_soft_cap == (
+                            self.logits_soft_cap or 0.0
+                        )
+                        assert prefill_wrapper._context._sm_scale == self.scale
+                        assert not prefill_wrapper._context._causal
                     assert prefill_wrapper._new_tokens._window_left == self.window_left
                     assert prefill_wrapper._new_tokens._logits_soft_cap == (
                         self.logits_soft_cap or 0.0

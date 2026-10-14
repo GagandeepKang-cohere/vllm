@@ -204,6 +204,7 @@ if TYPE_CHECKING:
     VLLM_MOE_USE_DEEP_GEMM: bool = True
     VLLM_USE_DEEP_GEMM_E8M0: bool = True
     VLLM_USE_DEEP_GEMM_TMA_ALIGNED_SCALES: bool = True
+    VLLM_DCP_TRTLLM_PREFILL: bool = False
     VLLM_DCP_Q_REPLICATE: bool = False
     VLLM_USE_DIRECT_DCP_A2A: bool | None = None
     VLLM_USE_DIRECT_DCP_Q_GATHER: bool | None = None
@@ -1633,6 +1634,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Whether to create TMA-aligned scale tensor when DeepGEMM is used.
     "VLLM_USE_DEEP_GEMM_TMA_ALIGNED_SCALES": lambda: bool(
         int(os.getenv("VLLM_USE_DEEP_GEMM_TMA_ALIGNED_SCALES", "1"))
+    ),
+    # Experimental: use the trtllm-gen paged context kernel (non-causal + LSE)
+    # for the DCP prefill context pass instead of the slower FlashInfer native
+    # paged kernel. Only engages for full-attention (window_left == -1), bf16 KV
+    # layers; requires a FlashInfer that exposes causal/return_lse on
+    # trtllm_batch_context_with_kv_cache.
+    "VLLM_DCP_TRTLLM_PREFILL": lambda: bool(
+        int(os.getenv("VLLM_DCP_TRTLLM_PREFILL", "0"))
     ),
     # Opt-in MLA DCP query replication: skip the decode query all-gather.
     "VLLM_DCP_Q_REPLICATE": lambda: bool(int(os.getenv("VLLM_DCP_Q_REPLICATE", "0"))),
