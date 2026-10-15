@@ -419,6 +419,10 @@ class BatchDCPPrefillWrapper:
             dtype=torch.float32,
             device=q.device,
         )
+        if c["max_kv_len"] == 0:
+            # No request has any context on this rank (e.g. first chunk):
+            # nothing to attend to, so skip the kernel entirely.
+            return out, lse
         # bf16 path: q/k/v scale == 1.0, so bmm1 == sm_scale, bmm2 == 1.0;
         # computed via layer scales to mirror forward()'s bmm scale logic.
         bmm1_scale = c["sm_scale"] * layer._q_scale_float * layer._k_scale_float
@@ -442,6 +446,12 @@ class BatchDCPPrefillWrapper:
             lse=lse,
             out=out,
         )
+        if c["has_empty_rows"]:
+            # Mixed batch: reset rows of requests with no local context to the
+            # neutral element, whatever the kernel wrote there.
+            no_ctx = ~c["row_has_ctx"]
+            lse.masked_fill_(no_ctx[:, None], float("-inf"))
+            out.masked_fill_(no_ctx[:, None, None], 0)
         return out, lse
 
     def _verify_trtllm_context(
@@ -1863,7 +1873,17 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                         query_lens_prefill_cpu = (
                             qo_indptr_prefill_cpu[1:] - qo_indptr_prefill_cpu[:-1]
                         )
+                        # Rows of requests with an empty DCP-local context. The
+                        # kernel does not leave these untouched (it has been
+                        # observed writing non-neutral LSE for them), so they are
+                        # explicitly reset to (0, -inf) after the kernel runs.
+                        has_ctx_cpu = ctx_seq_lens_cpu > 0
+                        row_has_ctx_cpu = torch.repeat_interleave(
+                            has_ctx_cpu, query_lens_prefill_cpu.to(torch.int64)
+                        )
                         trtllm_context = {
+                            "has_empty_rows": bool((~has_ctx_cpu).any().item()),
+                            "row_has_ctx": row_has_ctx_cpu.to(device),
                             "block_tables": block_table_tensor[prefill_start:],
                             "seq_lens": ctx_seq_lens_cpu.to(device),
                             "cum_seq_lens_q": (
