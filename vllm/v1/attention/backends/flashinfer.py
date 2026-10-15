@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Attention layer with FlashInfer."""
 
+import os
 from dataclasses import dataclass, replace
 from enum import Enum
 from functools import partial
@@ -102,6 +103,14 @@ FP8_DTYPE = current_platform.fp8_dtype()
 FP4_DTYPE = torch.uint8
 
 logger = init_logger(__name__)
+
+# DEBUG: compare the trtllm-gen DCP prefill context kernel against the native
+# paged kernel in-situ. Remove before upstreaming.
+_DCP_TRTLLM_VERIFY = os.environ.get("VLLM_DCP_TRTLLM_VERIFY", "0") == "1"
+_DCP_TRTLLM_VERIFY_MAX_CALLS = int(
+    os.environ.get("VLLM_DCP_TRTLLM_VERIFY_MAX_CALLS", "40")
+)
+_verify_calls = 0
 
 trtllm_workspace_buffer = None
 
@@ -390,6 +399,119 @@ class BatchDCPPrefillWrapper:
             q_data_type=q_data_type,
         )
 
+    def _run_trtllm_context(
+        self,
+        layer: torch.nn.Module,
+        q: torch.Tensor,
+        kv_cache_tuple: tuple[torch.Tensor, torch.Tensor],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        c = self._trtllm_ctx
+        assert c is not None
+        # Requests whose DCP-local context is empty (first chunk, or a rank
+        # holding none of this request's context) are not written by the
+        # kernel. Start from the neutral element (zero output, -inf LSE) so
+        # they drop out of the cross-rank combine and the final merge, as
+        # they do with the FlashInfer native paged kernel.
+        out = torch.zeros_like(q)
+        lse = torch.full(
+            (q.shape[0], q.shape[1]),
+            float("-inf"),
+            dtype=torch.float32,
+            device=q.device,
+        )
+        # bf16 path: q/k/v scale == 1.0, so bmm1 == sm_scale, bmm2 == 1.0;
+        # computed via layer scales to mirror forward()'s bmm scale logic.
+        bmm1_scale = c["sm_scale"] * layer._q_scale_float * layer._k_scale_float
+        bmm2_scale = layer._v_scale_float
+        trtllm_batch_context_with_kv_cache(
+            query=q,
+            kv_cache=kv_cache_tuple,
+            workspace_buffer=c["workspace"],
+            block_tables=c["block_tables"],
+            seq_lens=c["seq_lens"],
+            max_q_len=c["max_q_len"],
+            max_kv_len=c["max_kv_len"],
+            bmm1_scale=bmm1_scale,
+            bmm2_scale=bmm2_scale,
+            batch_size=c["batch_size"],
+            cum_seq_lens_q=c["cum_seq_lens_q"],
+            cum_seq_lens_kv=c["cum_seq_lens_kv"],
+            window_left=c["window_left"],
+            causal=False,
+            return_lse=True,
+            lse=lse,
+            out=out,
+        )
+        return out, lse
+
+    def _verify_trtllm_context(
+        self,
+        layer: torch.nn.Module,
+        q: torch.Tensor,
+        kv_cache_tuple: tuple[torch.Tensor, torch.Tensor],
+        out_t: torch.Tensor,
+        lse_t: torch.Tensor,
+    ) -> None:
+        """DEBUG ONLY (VLLM_DCP_TRTLLM_VERIFY=1): compare the trtllm-gen context
+        kernel against the FlashInfer native paged kernel on identical inputs
+        and metadata, per rank, and check run-to-run determinism. Syncs the
+        device; never enable for benchmarking."""
+        global _verify_calls
+        if _verify_calls >= _DCP_TRTLLM_VERIFY_MAX_CALLS:
+            return
+        _verify_calls += 1
+        c = self._trtllm_ctx
+        assert c is not None
+        out_n, lse_n = self._context.run(
+            q,
+            kv_cache_tuple,
+            k_scale=layer._k_scale_float,
+            v_scale=layer._v_scale_float,
+            return_lse=True,
+        )
+        out2, lse2 = self._run_trtllm_context(layer, q, kv_cache_tuple)
+        # Rows belonging to requests with a non-empty local context.
+        q_lens = c["cum_seq_lens_q"][1:] - c["cum_seq_lens_q"][:-1]
+        row_has_ctx = torch.repeat_interleave(c["seq_lens"] > 0, q_lens)
+        n_rows = int(row_has_ctx.sum().item())
+        n_empty = int((~row_has_ctx).sum().item())
+        msg = (
+            f"[dcp-trtllm-verify] call={_verify_calls} "
+            f"rank={get_dcp_group().rank_in_group} "
+            f"layer={getattr(layer, 'layer_name', '?')} "
+            f"ctx_rows={n_rows} empty_rows={n_empty} "
+            f"local_ctx_lens={c['seq_lens'].tolist()} "
+            f"max_kv_len={c['max_kv_len']} "
+            f"nan(out)={bool(torch.isnan(out_t).any())} "
+            f"nan(lse)={bool(torch.isnan(lse_t).any())} "
+            f"bitwise_repeatable="
+            f"{bool(torch.equal(out_t, out2) and torch.equal(lse_t, lse2))}"
+        )
+        if n_rows:
+            m = row_has_ctx
+            d_out = (out_t[m].float() - out_n[m].float()).abs()
+            ref = out_n[m].float().abs().mean().clamp_min(1e-6)
+            lt, ln = lse_t[m], lse_n[m]
+            d_lse = lt - ln
+            ratio = (lt / ln)[torch.isfinite(lt / ln)]
+            ratio_mean = ratio.mean().item() if ratio.numel() else float("nan")
+            rel = d_out.mean().item() / ref.item()
+            msg += (
+                f" | out: max_abs={d_out.max().item():.4g}"
+                f" mean_abs={d_out.mean().item():.4g} rel={rel:.4g}"
+                f" | lse(trtllm-native): mean={d_lse.mean().item():.4g}"
+                f" std={d_lse.std().item():.4g}"
+                f" max_abs={d_lse.abs().max().item():.4g}"
+                f" ratio_mean={ratio_mean:.4g} (0.693 => ln vs log2)"
+            )
+        if n_empty:
+            e = ~row_has_ctx
+            msg += (
+                f" | empty rows: max|out|={out_t[e].abs().max().item():.3g} "
+                f"max(lse)={lse_t[e].max().item():.3g}"
+            )
+        logger.warning(msg)
+
     def run(
         self,
         layer: torch.nn.Module,
@@ -415,45 +537,20 @@ class BatchDCPPrefillWrapper:
             # Returns per-shard LSE so the existing cross-rank combine still
             # applies. KV layout must be HND (asserted on the non-DCP trtllm
             # path); global-attention layers have window_left == -1.
-            c = self._trtllm_ctx
             q = canonicalize_singleton_dim_strides(
                 prefill_query_across_dcp.contiguous()
             )
-            # Requests whose DCP-local context is empty (first chunk, or a rank
-            # holding none of this request's context) are not written by the
-            # kernel. Start from the neutral element (zero output, -inf LSE) so
-            # they drop out of the cross-rank combine and the final merge, as
-            # they do with the FlashInfer native paged kernel.
-            output_context_tmp = torch.zeros_like(q)
-            lse_context_tmp = torch.full(
-                (q.shape[0], q.shape[1]),
-                float("-inf"),
-                dtype=torch.float32,
-                device=q.device,
+            output_context_tmp, lse_context_tmp = self._run_trtllm_context(
+                layer, q, kv_cache_tuple
             )
-            # bf16 path: q/k/v scale == 1.0, so bmm1 == sm_scale, bmm2 == 1.0;
-            # computed via layer scales to mirror forward()'s bmm scale logic.
-            bmm1_scale = c["sm_scale"] * layer._q_scale_float * layer._k_scale_float
-            bmm2_scale = layer._v_scale_float
-            trtllm_batch_context_with_kv_cache(
-                query=q,
-                kv_cache=kv_cache_tuple,
-                workspace_buffer=c["workspace"],
-                block_tables=c["block_tables"],
-                seq_lens=c["seq_lens"],
-                max_q_len=c["max_q_len"],
-                max_kv_len=c["max_kv_len"],
-                bmm1_scale=bmm1_scale,
-                bmm2_scale=bmm2_scale,
-                batch_size=c["batch_size"],
-                cum_seq_lens_q=c["cum_seq_lens_q"],
-                cum_seq_lens_kv=c["cum_seq_lens_kv"],
-                window_left=c["window_left"],
-                causal=False,
-                return_lse=True,
-                lse=lse_context_tmp,
-                out=output_context_tmp,
-            )
+            if _DCP_TRTLLM_VERIFY:
+                self._verify_trtllm_context(
+                    layer,
+                    q,
+                    kv_cache_tuple,
+                    output_context_tmp,
+                    lse_context_tmp,
+                )
         output_context, lse_context = self._dcp_combine(
             output_context_tmp,
             lse_context_tmp,
