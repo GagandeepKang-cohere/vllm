@@ -925,6 +925,25 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             and self.num_qo_heads // self.num_kv_heads > 1
         ), f"Unexpected FlashInfer page size {self.page_size} without trtllm-gen GQA"
         self.use_trtllm_decode_attention = can_use_xqa_or_trtllm_gen_decode
+        # Opt-in trtllm-gen context kernel for the DCP prefill context pass. The
+        # check also covers the platform (SM100+, cubin access, batch-invariant
+        # mode) and an explicit use_trtllm_attention=0.
+        self.use_trtllm_dcp_prefill = (
+            envs.VLLM_DCP_TRTLLM_PREFILL
+            and self.use_dcp
+            and can_use_trtllm_attention(
+                self.num_qo_heads, self.num_kv_heads, is_prefill=True
+            )
+        )
+        if envs.VLLM_DCP_TRTLLM_PREFILL and self.use_dcp:
+            if self.use_trtllm_dcp_prefill:
+                logger.info_once("Using the trtllm-gen context kernel for DCP prefill.")
+            else:
+                logger.warning_once(
+                    "VLLM_DCP_TRTLLM_PREFILL=1 is ignored: trtllm-gen prefill "
+                    "is not available here (requires SM100/SM103, and "
+                    "use_trtllm_attention must not be 0)."
+                )
         self.flashinfer_trtllm_api_decode_kernel: FlashInferDecodeKernel | None = (
             self._get_flashinfer_trtllm_api_decode_kernel()
             if can_use_xqa_or_trtllm_gen_decode
@@ -1727,7 +1746,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                     # full-attention (window_left == -1), unquantized-KV layers.
                     trtllm_context = None
                     if (
-                        envs.VLLM_DCP_TRTLLM_PREFILL
+                        self.use_trtllm_dcp_prefill
                         and self.window_left == -1
                         and self.kv_cache_spec.kv_quant_mode == KVQuantMode.NONE
                     ):
