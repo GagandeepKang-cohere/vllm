@@ -419,9 +419,15 @@ class BatchDCPPrefillWrapper:
             q = canonicalize_singleton_dim_strides(
                 prefill_query_across_dcp.contiguous()
             )
-            output_context_tmp = torch.empty_like(q)
-            lse_context_tmp = torch.empty(
+            # Requests whose DCP-local context is empty (first chunk, or a rank
+            # holding none of this request's context) are not written by the
+            # kernel. Start from the neutral element (zero output, -inf LSE) so
+            # they drop out of the cross-rank combine and the final merge, as
+            # they do with the FlashInfer native paged kernel.
+            output_context_tmp = torch.zeros_like(q)
+            lse_context_tmp = torch.full(
                 (q.shape[0], q.shape[1]),
+                float("-inf"),
                 dtype=torch.float32,
                 device=q.device,
             )
